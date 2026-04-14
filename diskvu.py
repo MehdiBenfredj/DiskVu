@@ -25,13 +25,23 @@ import threading
 import subprocess
 import random
 import platform
+import argparse
+import signal
+import locale
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, Callable
 
 IS_MACOS = platform.system() == "Darwin"
 IS_LINUX = platform.system() == "Linux"
 
+__version__ = "1.1.0"
+
+# Set to True via --ascii or auto-detected when terminal doesn't support Unicode
+ASCII_MODE = False
+
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+_SPINNER_ASCII = r"|/-\\"
 
 # Sentinel for "directory exists but size is unknown due to access restrictions"
 UNKNOWN_SIZE = -1
@@ -98,15 +108,19 @@ SIZE_EMOJIS = [
     (0,               "🐜"),  # anything else — ant
 ]
 
+_ASCII_SIZE_LABELS = ["[TB]", "[HG]", "[10G]","[1G]", "[HM]", "[10M]","[1M]", "[sm]"]
+
 def size_emoji(nbytes: int) -> str:
     if nbytes == UNKNOWN_SIZE:
-        return "🔒"
-    for threshold, emoji in SIZE_EMOJIS:
+        return "[?]" if ASCII_MODE else "🔒"
+    for i, (threshold, emoji) in enumerate(SIZE_EMOJIS):
         if nbytes >= threshold:
-            return emoji
-    return "🐜"
+            return _ASCII_SIZE_LABELS[i] if ASCII_MODE else emoji
+    return "[.]" if ASCII_MODE else "🐜"
 
 def file_icon(name: str, is_dir: bool) -> str:
+    if ASCII_MODE:
+        return "[/]" if is_dir else "[F]"
     if is_dir:
         return "📁"
     ext = os.path.splitext(name)[1].lower()
@@ -140,6 +154,10 @@ _SKIP_DIR_NAMES = frozenset({
     "debug", "tracing",
     # macOS automount / synthetic links
     "net", "home",
+    # Linux containers / cgroups
+    "cgroup", "cgroup2", "cgroupv2",
+    # Kernel special dirs
+    "configfs", "securityfs", "pstore", "efivarfs",
 })
 
 # Absolute paths — platform-specific
@@ -149,10 +167,70 @@ _SKIP_ABS_PATHS: frozenset = frozenset(
         "/private/var/folders",  # macOS per-user temp dirs
         "/cores",                # macOS kernel crash cores
     ] if IS_MACOS else [
-        "/proc", "/sys", "/dev", # Linux virtual FS roots
-        "/run/user",             # per-user runtime dirs
+        "/proc", "/sys", "/dev",         # Linux virtual FS roots
+        "/run/user",                     # per-user runtime dirs
+        "/sys/kernel/debug",             # debugfs
+        "/sys/kernel/tracing",           # tracefs
     ]
 )
+
+# ─── Network/remote filesystem detection ─────────────────────────────────────
+
+_NETWORK_FS_TYPES = frozenset({
+    "nfs", "nfs4", "nfs3",
+    "cifs", "smb", "smbfs",
+    "afs", "coda",
+    "ncpfs", "ncp",
+    "davfs", "sshfs", "ftpfs",
+    "s3fs", "s3fuse",           # S3 FUSE mounts
+    "efs",                      # AWS EFS (shows as "nfs4" on Linux but just in case)
+})
+
+# Built once at startup: mountpoint → fstype
+def _build_mount_table() -> dict[str, str]:
+    table: dict[str, str] = {}
+    try:
+        if IS_LINUX:
+            with open("/proc/mounts") as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        table[parts[1]] = parts[2].lower()
+        elif IS_MACOS:
+            r = subprocess.run(["mount"], capture_output=True, text=True, timeout=2)
+            for line in r.stdout.splitlines():
+                # Format: device on /mountpoint (fstype, ...)
+                m = re.match(r".+ on (.+) \((\w+)", line)
+                if m:
+                    table[m.group(1)] = m.group(2).lower()
+    except Exception:
+        pass
+    return table
+
+_MOUNT_TABLE: dict[str, str] = _build_mount_table()
+
+
+def _fs_type_for_path(path: str) -> str:
+    """Return filesystem type for *path* using cached mount table (best-effort)."""
+    try:
+        norm = os.path.normpath(os.path.realpath(path))
+    except OSError:
+        return ""
+    best = ""
+    fs_type = ""
+    for mount, typ in _MOUNT_TABLE.items():
+        if (norm == mount or norm.startswith(mount + "/")) and len(mount) > len(best):
+            best = mount
+            fs_type = typ
+    return fs_type
+
+
+def _is_network_fs(path: str) -> bool:
+    return _fs_type_for_path(path) in _NETWORK_FS_TYPES
+
+
+# Whether to skip network FS directories (set by --skip-network flag)
+SKIP_NETWORK = False
 
 # Human-readable fix hint for inaccessible directories — platform-aware
 if IS_MACOS:
@@ -175,7 +253,11 @@ def _should_skip(path: str) -> bool:
     for prefix in _SKIP_ABS_PATHS:
         if norm.startswith(prefix + "/"):
             return True
-    return os.path.basename(norm) in _SKIP_DIR_NAMES
+    if os.path.basename(norm) in _SKIP_DIR_NAMES:
+        return True
+    if SKIP_NETWORK and _is_network_fs(path):
+        return True
+    return False
 
 
 # ─── Scanning ────────────────────────────────────────────────────────────────
@@ -269,6 +351,9 @@ def _worker_size_dir(
     if _should_skip(path):
         return item, 0, 0, "skipped"
 
+    # Mark network FS directories — du on NFS/EFS can be very slow
+    is_net = _is_network_fs(path)
+
     # Report just the basename so the status line shows "Downloads" not "/Users/mehdi/Downloads".
     # Skip hidden entries (dotfiles) — they're noise in a progress display.
     if on_scanning:
@@ -277,11 +362,14 @@ def _worker_size_dir(
             on_scanning(name)
 
     # ── du -s fast path ───────────────────────────────────────────────────
+    # 3 minutes covers large directories on spinning disks.
+    # Network mounts get the same budget — users with slow mounts should use --skip-network.
+    du_timeout = 180
     try:
         result = subprocess.run(
             ["du", "-s", "-k", path],
             capture_output=True, text=True,
-            timeout=300, errors="replace"
+            timeout=du_timeout, errors="replace"
         )
         # macOS/BSD du exits with 1 when it hits permission errors inside a dir.
         # Crucially it still outputs "0\t<path>" — a *false* zero.  Detect this
@@ -302,7 +390,7 @@ def _worker_size_dir(
                         # du couldn't read the directory — returned 0 falsely
                         return item, UNKNOWN_SIZE, 0, "inaccessible"
                     count = _shallow_count(path)
-                    return item, size, count, ""
+                    return item, size, count, "network" if is_net else ""
                 except ValueError:
                     pass
             # du ran but produced no output at all
@@ -310,7 +398,7 @@ def _worker_size_dir(
                 return item, UNKNOWN_SIZE, 0, "inaccessible"
 
     except subprocess.TimeoutExpired:
-        return item, UNKNOWN_SIZE, 0, "timeout"
+        return item, UNKNOWN_SIZE, 0, "timeout >3min"
     except (FileNotFoundError, OSError):
         pass
 
@@ -324,7 +412,7 @@ def _worker_size_dir(
         pass
 
     size, count = _compute_dir_size(path)
-    return item, size, count, ""
+    return item, size, count, "network" if is_net else ""
 
 
 def scan_directory(
@@ -782,11 +870,16 @@ class DiskVuApp:
         self.stdscr.attron(header_attr)
         self.stdscr.addnstr(0, 0, " " * w, w)
         if self.scanning:
-            spin = SPINNER[self._spinner_frame % len(SPINNER)]
+            sp_chars = _SPINNER_ASCII if ASCII_MODE else SPINNER
+            spin = sp_chars[self._spinner_frame % len(sp_chars)]
             self._spinner_frame += 1
-            title = f" {spin} {self._quip}"
+            if ASCII_MODE:
+                quip = self._quip.encode("ascii", "replace").decode("ascii")
+                title = f" {spin} {quip}"
+            else:
+                title = f" {spin} {self._quip}"
         else:
-            title = f" 🗂️  DiskVu — {self.current_path}"
+            title = f" DiskVu -- {self.current_path}" if ASCII_MODE else f" 🗂️  DiskVu — {self.current_path}"
         self.stdscr.addnstr(0, 0, title[:w], w)
         if not self.scanning:
             known = human_size(self.total_size).strip()
@@ -871,7 +964,7 @@ class DiskVuApp:
         safe_w = max(0, w - 1)
         self.stdscr.addnstr(help_y, 0, " " * safe_w, safe_w,
                             curses.color_pair(C_BORDER))
-        help_text = " ↑↓/jk:move  ↵/→/l:open  ←/h/BS:back  r:rescan  d:delete  q:quit"
+        help_text = " ↑↓/jk:move  ↵/→/l:open  ←/h/BS:back  r:rescan  d:delete  ~:home  o:open  q:quit"
         self.stdscr.addnstr(help_y, 0, help_text[:safe_w], safe_w,
                             curses.color_pair(C_BORDER))
         credit = f" {CREDIT} "
@@ -902,6 +995,9 @@ class DiskVuApp:
         bar_max = 20
         if unknown:
             bar_str = "?" * bar_max
+        elif ASCII_MODE:
+            filled = int(pct / 100 * bar_max) if self.total_size > 0 else 0
+            bar_str = "#" * filled + "-" * (bar_max - filled)
         else:
             filled = int(pct / 100 * bar_max) if self.total_size > 0 else 0
             partial_chars = " ▏▎▍▌▋▊▉"
@@ -918,10 +1014,13 @@ class DiskVuApp:
                 name += f"  ({entry.item_count} items)"
         else:
             name = f"{icon} {entry.name}"
-        if entry.error and entry.error not in ("symlink",):
-            name += f" ⚠️  [{entry.error}]"
+        # Annotate entries with notable flags
+        if entry.error == "network":
+            name += " 🌐" if not ASCII_MODE else " [NET]"
+        elif entry.error and entry.error not in ("symlink",):
+            name += f" ⚠️  [{entry.error}]" if not ASCII_MODE else f" [!] [{entry.error}]"
         elif entry.error == "symlink":
-            name += " 🔗"
+            name += " 🔗" if not ASCII_MODE else " [->]"
 
         size_color = (C_ERROR if unknown
                       else C_SIZE_BIG if entry.size > 1024 ** 3
@@ -1083,10 +1182,47 @@ class DiskVuApp:
                 self._go_back()
             elif key in (ord('r'), ord('R')):
                 _cache_invalidate(self.current_path)
-                self._after_scan_message = "🔄 Fresh scan complete!"
+                self._after_scan_message = "Rescan complete!" if ASCII_MODE else "🔄 Fresh scan complete!"
                 self._start_scan(clear_immediately=False)
             elif key in (ord('d'), ord('D')):
                 self._delete_selected()
+            elif key == ord('~'):
+                home = os.path.expanduser("~")
+                if os.path.isdir(home) and home != self.current_path:
+                    self._save_partials()
+                    self.history.clear()
+                    self.current_path = home
+                    self._pending_nav = None
+                    self._start_scan(clear_immediately=True)
+            elif key in (ord('o'), ord('O')):
+                self._open_in_manager()
+
+    def _open_in_manager(self) -> None:
+        """Open the selected entry (or current dir) in the platform file manager."""
+        if self.entries:
+            target = self.entries[self.cursor].path
+        else:
+            target = self.current_path
+        try:
+            if IS_MACOS:
+                subprocess.Popen(["open", "-R", target],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            elif IS_LINUX:
+                # Try common file managers; fall back to xdg-open
+                for cmd in (["nautilus", "--select", target],
+                            ["dolphin", "--select", target],
+                            ["thunar", target],
+                            ["xdg-open", os.path.dirname(target)]):
+                    try:
+                        subprocess.Popen(cmd,
+                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        break
+                    except FileNotFoundError:
+                        continue
+            msg = "Opened in file manager" if ASCII_MODE else "📂 Opened in file manager"
+            self._set_message(msg)
+        except Exception as exc:
+            self._set_message(f"Could not open: {exc}")
 
 
 def main(stdscr, path: str) -> None:
@@ -1094,12 +1230,107 @@ def main(stdscr, path: str) -> None:
     app.run()
 
 
-if __name__ == "__main__":
-    target = sys.argv[1] if len(sys.argv) > 1 else "."
-    target = os.path.abspath(target)
+def _detect_unicode_support() -> bool:
+    """Return True when the terminal likely renders Unicode/emoji correctly."""
+    # Explicit env override
+    if os.environ.get("DISKVU_ASCII", "").lower() in ("1", "true", "yes"):
+        return False
+    # Check locale encoding
+    for var in ("LC_ALL", "LC_CTYPE", "LANG"):
+        val = os.environ.get(var, "")
+        if "utf" in val.lower():
+            return True
+    try:
+        if "utf" in locale.getpreferredencoding(False).lower():
+            return True
+    except Exception:
+        pass
+    return False
 
+
+def _cli() -> None:
+    global ASCII_MODE, SKIP_NETWORK
+
+    parser = argparse.ArgumentParser(
+        prog="diskvu",
+        description="DiskVu — interactive TUI disk analyzer (macOS / Linux / EC2)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Navigation:
+  ↑/↓  or k/j     move cursor
+  Enter / → / l   enter directory
+  ← / h / BS      go to parent
+  ~                jump to home directory
+  r                rescan current directory
+  d                delete selected (with confirmation)
+  o                reveal in file manager (desktop only)
+  q / Esc          quit
+
+Examples:
+  diskvu                    # scan current directory
+  diskvu /                  # scan root
+  diskvu --ascii ~          # ASCII mode for SSH/EC2 sessions
+  diskvu --skip-network /   # skip NFS/EFS mounts
+""",
+    )
+    parser.add_argument(
+        "path",
+        nargs="?",
+        default=".",
+        metavar="PATH",
+        help="directory to scan (default: current directory)",
+    )
+    parser.add_argument(
+        "-a", "--ascii",
+        action="store_true",
+        help="force ASCII output (auto-enabled when locale is not UTF-8)",
+    )
+    parser.add_argument(
+        "--no-ascii",
+        action="store_true",
+        help="force emoji/Unicode output even on non-UTF-8 terminals",
+    )
+    parser.add_argument(
+        "--skip-network",
+        action="store_true",
+        help="skip NFS, CIFS, and other network/remote filesystems",
+    )
+    parser.add_argument(
+        "-V", "--version",
+        action="version",
+        version=f"diskvu {__version__}",
+    )
+
+    args = parser.parse_args()
+
+    # Resolve ASCII mode: explicit flag beats auto-detection
+    if args.ascii:
+        ASCII_MODE = True
+    elif args.no_ascii:
+        ASCII_MODE = False
+    else:
+        ASCII_MODE = not _detect_unicode_support()
+
+    if args.skip_network:
+        SKIP_NETWORK = True
+
+    target = os.path.abspath(args.path)
     if not os.path.isdir(target):
         print(f"Error: '{target}' is not a directory", file=sys.stderr)
         sys.exit(1)
 
-    curses.wrapper(main, target)
+    # Handle SIGTERM cleanly — curses needs to restore the terminal
+    def _sigterm_handler(sig, frame):  # noqa: ANN001
+        curses.endwin()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+
+    try:
+        curses.wrapper(main, target)
+    except KeyboardInterrupt:
+        pass  # Ctrl+C — curses.wrapper already cleaned up the terminal
+
+
+if __name__ == "__main__":
+    _cli()
