@@ -673,9 +673,13 @@ class DiskVuApp:
             self.entries = []
             self.total_size = 0
 
-        with self._partial_lock:
-            self._partial_entries = list(saved)
-        self._scan_count = len(saved)
+        # Pre-populate the accumulation buffer ONLY when re-attaching to a still-
+        # running worker (see below).  For a fresh scan we must start the buffer
+        # empty — otherwise the saved items would be duplicated because the new
+        # worker's on_entry (or a cache-replay) will emit every entry again.
+        # self.entries already holds the saved snapshot for visual continuity;
+        # _poll_scan only overwrites it once the first real entry arrives.
+        self._scan_count = 0
 
         self.scanning = True
         self._spinner_frame = 0
@@ -688,13 +692,20 @@ class DiskVuApp:
         with _scanning_now_lock:
             already_running = path in _scanning_now
         if already_running:
+            # Restore saved items into the buffer so the live-appending worker
+            # builds on top of them rather than starting from an empty list.
+            with self._partial_lock:
+                self._partial_entries = list(saved)
+            self._scan_count = len(saved)
             # Reset visible counters so the progress row looks live again
             self._scan_status = ""
             self._scan_dirs_done = 0
             self._scan_dirs_total = 0
             return  # original worker will apply its result when done
 
-        # ── Fresh scan ────────────────────────────────────────────────────────
+        # ── Fresh scan — accumulation buffer starts empty ─────────────────────
+        with self._partial_lock:
+            self._partial_entries = []
         self._scan_status = ""
         self._scan_dirs_done = 0
         self._scan_dirs_total = 0
