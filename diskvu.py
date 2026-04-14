@@ -276,6 +276,10 @@ class DirEntry:
         self.error = error
 
 
+# ─── Cancellation ────────────────────────────────────────────────────────────
+# Set this event to abort all in-flight du subprocesses immediately (q / SIGTERM).
+_cancel_scan = threading.Event()
+
 # ─── Cache ───────────────────────────────────────────────────────────────────
 # path → (dir_mtime, entries)
 _dir_cache: dict[str, tuple[float, list]] = {}
@@ -366,21 +370,41 @@ def _worker_size_dir(
     # Network mounts get the same budget — users with slow mounts should use --skip-network.
     du_timeout = 180
     try:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             ["du", "-s", "-k", path],
-            capture_output=True, text=True,
-            timeout=du_timeout, errors="replace"
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, errors="replace",
         )
+        # Poll in 100ms slices so we can react to cancellation and enforce the
+        # timeout without blocking the thread for the full duration.
+        deadline = time.monotonic() + du_timeout
+        while True:
+            if _cancel_scan.is_set():
+                proc.kill()
+                proc.wait()
+                return item, UNKNOWN_SIZE, 0, "cancelled"
+            try:
+                proc.wait(timeout=0.1)
+                break           # process exited normally
+            except subprocess.TimeoutExpired:
+                if time.monotonic() >= deadline:
+                    proc.kill()
+                    proc.wait()
+                    return item, UNKNOWN_SIZE, 0, "timeout >3min"
+
+        stdout = proc.stdout.read()
+        stderr = proc.stderr.read()
+
         # macOS/BSD du exits with 1 when it hits permission errors inside a dir.
         # Crucially it still outputs "0\t<path>" — a *false* zero.  Detect this
         # by checking stderr for access-denial keywords.
-        stderr_lower = result.stderr.lower()
+        stderr_lower = stderr.lower()
         access_denied = any(kw in stderr_lower for kw in (
             "permission denied", "operation not permitted", "not permitted",
         ))
 
-        if result.returncode in (0, 1):
-            for line in result.stdout.splitlines():
+        if proc.returncode in (0, 1):
+            for line in stdout.splitlines():
                 if "\t" not in line:
                     continue
                 kb_str, _, _ = line.partition("\t")
@@ -397,8 +421,6 @@ def _worker_size_dir(
             if access_denied:
                 return item, UNKNOWN_SIZE, 0, "inaccessible"
 
-    except subprocess.TimeoutExpired:
-        return item, UNKNOWN_SIZE, 0, "timeout >3min"
     except (FileNotFoundError, OSError):
         pass
 
@@ -1238,7 +1260,12 @@ class DiskVuApp:
 
 def main(stdscr, path: str) -> None:
     app = DiskVuApp(stdscr, path)
-    app.run()
+    try:
+        app.run()
+    finally:
+        # Signal all du subprocesses to terminate immediately so that Python's
+        # atexit/ThreadPoolExecutor shutdown doesn't block waiting for them.
+        _cancel_scan.set()
 
 
 def _detect_unicode_support() -> bool:
@@ -1340,7 +1367,9 @@ Examples:
     try:
         curses.wrapper(main, target)
     except KeyboardInterrupt:
-        pass  # Ctrl+C — curses.wrapper already cleaned up the terminal
+        # Ctrl+C outside the curses event loop — ensure workers stop immediately
+        # so that ThreadPoolExecutor's atexit handler doesn't hang on t.join().
+        _cancel_scan.set()
 
 
 if __name__ == "__main__":
