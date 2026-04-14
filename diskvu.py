@@ -35,7 +35,7 @@ from typing import Optional, Callable
 IS_MACOS = platform.system() == "Darwin"
 IS_LINUX = platform.system() == "Linux"
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 # Set to True via --ascii or auto-detected when terminal doesn't support Unicode
 ASCII_MODE = False
@@ -45,6 +45,8 @@ _SPINNER_ASCII = r"|/-\\"
 
 # Sentinel for "directory exists but size is unknown due to access restrictions"
 UNKNOWN_SIZE = -1
+# Sentinel for "directory found but du hasn't returned yet"
+PENDING_SIZE = -2
 
 SCAN_QUIPS = [
     "🔍 Hunting for byte monsters...",
@@ -111,6 +113,8 @@ SIZE_EMOJIS = [
 _ASCII_SIZE_LABELS = ["[TB]", "[HG]", "[10G]","[1G]", "[HM]", "[10M]","[1M]", "[sm]"]
 
 def size_emoji(nbytes: int) -> str:
+    if nbytes == PENDING_SIZE:
+        return "[..]" if ASCII_MODE else "⏳"
     if nbytes == UNKNOWN_SIZE:
         return "[?]" if ASCII_MODE else "🔒"
     for i, (threshold, emoji) in enumerate(SIZE_EMOJIS):
@@ -131,6 +135,8 @@ def file_icon(name: str, is_dir: bool) -> str:
 
 def human_size(nbytes: int) -> str:
     """Convert bytes to a human-readable string."""
+    if nbytes == PENDING_SIZE:
+        return "  ...   "
     if nbytes == UNKNOWN_SIZE:
         return "   ???  "
     if nbytes < 0:
@@ -229,6 +235,14 @@ def _is_network_fs(path: str) -> bool:
     return _fs_type_for_path(path) in _NETWORK_FS_TYPES
 
 
+# Paths that must never be deleted, regardless of user confirmation
+_PROTECTED_DELETE_PATHS: frozenset = frozenset({
+    "/", "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64",
+    "/boot", "/sys", "/proc", "/dev", "/run", "/var",
+    "/System", "/Library", "/Applications", "/usr/local",
+    os.path.expanduser("~"),
+})
+
 # Whether to skip network FS directories (set by --skip-network flag)
 SKIP_NETWORK = False
 
@@ -319,12 +333,14 @@ def _shallow_count(path: str) -> int:
 
 def _compute_dir_size(path: str, depth: int = 0, max_depth: int = 64) -> tuple[int, int]:
     """Recursively compute total size and item count. Fallback when du is absent."""
-    if _should_skip(path) or depth > max_depth:
+    if _cancel_scan.is_set() or _should_skip(path) or depth > max_depth:
         return 0, 0
     total, count = 0, 0
     try:
         with os.scandir(path) as scanner:
             for item in scanner:
+                if _cancel_scan.is_set():
+                    return 0, 0
                 count += 1
                 try:
                     if item.is_symlink():
@@ -375,25 +391,30 @@ def _worker_size_dir(
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, errors="replace",
         )
-        # Poll in 100ms slices so we can react to cancellation and enforce the
-        # timeout without blocking the thread for the full duration.
-        deadline = time.monotonic() + du_timeout
-        while True:
-            if _cancel_scan.is_set():
-                proc.kill()
-                proc.wait()
-                return item, UNKNOWN_SIZE, 0, "cancelled"
-            try:
-                proc.wait(timeout=0.1)
-                break           # process exited normally
-            except subprocess.TimeoutExpired:
-                if time.monotonic() >= deadline:
+        try:
+            # Poll in 100ms slices so we can react to cancellation and enforce the
+            # timeout without blocking the thread for the full duration.
+            deadline = time.monotonic() + du_timeout
+            while True:
+                if _cancel_scan.is_set():
                     proc.kill()
                     proc.wait()
-                    return item, UNKNOWN_SIZE, 0, "timeout >3min"
+                    return item, UNKNOWN_SIZE, 0, "cancelled"
+                try:
+                    proc.wait(timeout=0.1)
+                    break           # process exited normally
+                except subprocess.TimeoutExpired:
+                    if time.monotonic() >= deadline:
+                        proc.kill()
+                        proc.wait()
+                        return item, UNKNOWN_SIZE, 0, "timeout >3min"
 
-        stdout = proc.stdout.read()
-        stderr = proc.stderr.read()
+            stdout = proc.stdout.read()
+            stderr = proc.stderr.read()
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
 
         # macOS/BSD du exits with 1 when it hits permission errors inside a dir.
         # Crucially it still outputs "0\t<path>" — a *false* zero.  Detect this
@@ -462,52 +483,65 @@ def scan_directory(
     entries: list[DirEntry] = []
     dir_items: list = []
 
-    # ── List the directory ────────────────────────────────────────────────
+    # ── List and emit in a single lazy pass ───────────────────────────────
+    # Using the context-manager form of os.scandir so we never hold a large
+    # list in memory and entries are emitted one-by-one as readdir returns
+    # them.  Directories are emitted immediately as PENDING_SIZE so the UI
+    # shows something before du has even started.
     try:
-        raw_items = list(os.scandir(path))
+        scanner_ctx = os.scandir(path)
     except (PermissionError, OSError):
         with _scanning_now_lock:
             _scanning_now.discard(path)
         return []
 
-    # ── Emit files / symlinks immediately (stat is free from scandir) ─────
-    for item in raw_items:
-        try:
-            if item.is_symlink():
-                st = item.stat(follow_symlinks=False)
-                e = DirEntry(name=item.name, path=item.path, is_dir=False,
-                             size=st.st_size, error="symlink")
-                entries.append(e)
-                if on_entry:
-                    on_entry(e)
-            elif item.is_dir(follow_symlinks=False):
-                if _should_skip(item.path):
-                    e = DirEntry(name=item.name, path=item.path, is_dir=True,
-                                 size=0, error="skipped")
+    with scanner_ctx as scanner:
+        for item in scanner:
+            if _cancel_scan.is_set():
+                break
+            try:
+                if item.is_symlink():
+                    st = item.stat(follow_symlinks=False)
+                    e = DirEntry(name=item.name, path=item.path, is_dir=False,
+                                 size=st.st_size, error="symlink")
                     entries.append(e)
                     if on_entry:
                         on_entry(e)
+                elif item.is_dir(follow_symlinks=False):
+                    if _should_skip(item.path):
+                        e = DirEntry(name=item.name, path=item.path, is_dir=True,
+                                     size=0, error="skipped")
+                        entries.append(e)
+                        if on_entry:
+                            on_entry(e)
+                    else:
+                        # Emit PENDING immediately — real size arrives when du finishes.
+                        # _poll_scan deduplicates by path so the pending entry is
+                        # replaced in-place without duplicates appearing.
+                        if on_entry:
+                            on_entry(DirEntry(name=item.name, path=item.path,
+                                              is_dir=True, size=PENDING_SIZE))
+                        dir_items.append(item)
                 else:
-                    dir_items.append(item)
-            else:
-                st = item.stat(follow_symlinks=False)
-                e = DirEntry(name=item.name, path=item.path, is_dir=False,
-                             size=st.st_size)
+                    st = item.stat(follow_symlinks=False)
+                    e = DirEntry(name=item.name, path=item.path, is_dir=False,
+                                 size=st.st_size)
+                    entries.append(e)
+                    if on_entry:
+                        on_entry(e)
+            except PermissionError:
+                e = DirEntry(name=item.name, path=item.path,
+                             is_dir=item.is_dir(follow_symlinks=False),
+                             error="permission denied")
                 entries.append(e)
                 if on_entry:
                     on_entry(e)
-        except PermissionError:
-            e = DirEntry(name=item.name, path=item.path,
-                         is_dir=item.is_dir(follow_symlinks=False),
-                         error="permission denied")
-            entries.append(e)
-            if on_entry:
-                on_entry(e)
-        except OSError as exc:
-            e = DirEntry(name=item.name, path=item.path, is_dir=False, error=str(exc))
-            entries.append(e)
-            if on_entry:
-                on_entry(e)
+            except OSError as exc:
+                e = DirEntry(name=item.name, path=item.path, is_dir=False,
+                             error=str(exc))
+                entries.append(e)
+                if on_entry:
+                    on_entry(e)
 
     # ── Size directories in parallel, stream results via as_completed ─────
     if on_dirs_known:
@@ -725,14 +759,66 @@ class DiskVuApp:
             self._scan_dirs_total = 0
             return  # original worker will apply its result when done
 
-        # ── Fresh scan — accumulation buffer starts empty ─────────────────────
-        with self._partial_lock:
-            self._partial_entries = []
+        # ── Fresh scan ────────────────────────────────────────────────────────
         self._scan_status = ""
         self._scan_dirs_done = 0
         self._scan_dirs_total = 0
         self._current_scan_id += 1
         scan_path = path   # captured in closures below
+
+        # ── Synchronous pre-listing (main thread, zero latency) ───────────────
+        # Run os.scandir on the main thread RIGHT NOW so the UI has entries to
+        # show before _start_scan even returns.  os.scandir is a single readdir()
+        # syscall per entry and completes in < 10 ms even for large / protected
+        # directories like ~/Library/.  Files get their real size; directories
+        # get PENDING_SIZE — the background worker will replace them with real
+        # sizes as du completes.  The accumulation buffer starts with these
+        # entries already in it; the worker thread deduplicates via _poll_scan.
+        pre_entries: list[DirEntry] = []
+        try:
+            with os.scandir(path) as _sc:
+                for _item in _sc:
+                    try:
+                        if _item.is_symlink():
+                            _st = _item.stat(follow_symlinks=False)
+                            pre_entries.append(DirEntry(
+                                name=_item.name, path=_item.path, is_dir=False,
+                                size=_st.st_size, error="symlink"))
+                        elif _item.is_dir(follow_symlinks=False):
+                            _sz = 0 if _should_skip(_item.path) else PENDING_SIZE
+                            _err = "skipped" if _should_skip(_item.path) else ""
+                            pre_entries.append(DirEntry(
+                                name=_item.name, path=_item.path, is_dir=True,
+                                size=_sz, error=_err))
+                        else:
+                            _st = _item.stat(follow_symlinks=False)
+                            pre_entries.append(DirEntry(
+                                name=_item.name, path=_item.path, is_dir=False,
+                                size=_st.st_size))
+                    except (PermissionError, OSError):
+                        pass
+        except (PermissionError, OSError):
+            pass  # no pre-listing available — worker will try again
+
+        # When returning to a path with saved entries, prefer the saved sizes
+        # over the PENDING_SIZE placeholder that pre-listing assigns to dirs.
+        # Without this, real sizes are stomped by PENDING every time you
+        # navigate back, causing a visible "restart" flash before the cache hit.
+        if saved and pre_entries:
+            saved_by_path = {e.path: e for e in saved}
+            init_partial = [saved_by_path.get(pe.path, pe) for pe in pre_entries]
+        else:
+            init_partial = pre_entries[:]
+        with self._partial_lock:
+            self._partial_entries = init_partial
+        # Immediately commit to self.entries so the first _draw() call already
+        # shows the directory contents (with real sizes when we have them).
+        if init_partial:
+            seen = {e.path: e for e in init_partial}
+            self.entries = sorted(seen.values(),
+                                  key=lambda e: e.size if e.size >= 0 else -1,
+                                  reverse=True)
+            self.total_size = sum(e.size for e in self.entries if e.size > 0)
 
         # All callbacks gate on current_path == scan_path so they become
         # no-ops if the user navigates away, but resume automatically if they
@@ -758,12 +844,15 @@ class DiskVuApp:
 
         def _worker() -> None:
             t0 = time.monotonic()
-            result = scan_directory(
-                scan_path,
-                on_entry=on_entry,
-                on_scanning=on_scanning,
-                on_dirs_known=on_dirs_known,
-            )
+            try:
+                result = scan_directory(
+                    scan_path,
+                    on_entry=on_entry,
+                    on_scanning=on_scanning,
+                    on_dirs_known=on_dirs_known,
+                )
+            except Exception:
+                result = []
             elapsed = time.monotonic() - t0
             with self._scan_lock:
                 # Apply result if the user is still on (or came back to) this path
@@ -774,13 +863,25 @@ class DiskVuApp:
 
     def _poll_scan(self) -> None:
         """Called every tick. Updates partial results and finalises when done."""
-        # Push live partial results into self.entries so the list grows in real time
+        # Push live partial results into self.entries so the list grows in real time.
+        # Dirs are emitted twice: first as PENDING_SIZE (immediately), then with
+        # the real size when du returns.  Deduplicate by path, keeping the latest
+        # entry so pending entries are replaced as workers complete.
         if self.scanning:
             with self._partial_lock:
                 partial = list(self._partial_entries)
             if partial:
-                self.entries = sorted(partial, key=lambda e: e.size, reverse=True)
-                self.total_size = sum(e.size for e in self.entries if e.size != UNKNOWN_SIZE)
+                seen: dict[str, DirEntry] = {}
+                for e in partial:
+                    seen[e.path] = e
+                # Sort: known sizes descending, then unknown/pending at the bottom
+                self.entries = sorted(
+                    seen.values(),
+                    key=lambda e: e.size if e.size >= 0 else -1,
+                    reverse=True,
+                )
+                # Only count real sizes in the total (exclude sentinels)
+                self.total_size = sum(e.size for e in self.entries if e.size > 0)
 
         # Check whether the scan has finished
         with self._scan_lock:
@@ -792,7 +893,7 @@ class DiskVuApp:
         self.entries = entries
         self.scan_time = elapsed
         # Exclude UNKNOWN_SIZE sentinels from the total so the number is honest
-        self.total_size = sum(e.size for e in entries if e.size != UNKNOWN_SIZE)
+        self.total_size = sum(e.size for e in entries if e.size > 0)
         self._inaccessible_count = sum(1 for e in entries if e.size == UNKNOWN_SIZE)
         self.scanning = False
 
@@ -859,6 +960,8 @@ class DiskVuApp:
 
     # ── Misc ──────────────────────────────────────────────────────────────────
 
+    _MAX_PARTIAL_CACHE = 50
+
     def _save_partials(self) -> None:
         """Persist the current partial results so _start_scan can restore them
         if the user comes back to this path before the scan finishes."""
@@ -866,6 +969,9 @@ class DiskVuApp:
             snapshot = list(self._partial_entries)
         if snapshot:
             self._partial_by_path[self.current_path] = snapshot
+            # Evict oldest entries when the cache grows too large
+            while len(self._partial_by_path) > self._MAX_PARTIAL_CACHE:
+                self._partial_by_path.pop(next(iter(self._partial_by_path)))
 
     def _set_message(self, msg: str) -> None:
         self.message = msg
@@ -928,11 +1034,11 @@ class DiskVuApp:
             done  = self._scan_dirs_done
             total = self._scan_dirs_total
             name  = self._scan_status
+            count = self._scan_count
 
-            # Progress fraction — shows "?" until first scandir completes
+            # Progress bar — only once we know how many dirs there are
             if total:
                 frac = f"{done}/{total} dirs"
-                # Mini ASCII progress bar: ████░░░░  (10 chars)
                 bar_w = 10
                 filled = int(done / total * bar_w)
                 mini_bar = "█" * filled + "░" * (bar_w - filled)
@@ -940,9 +1046,12 @@ class DiskVuApp:
             else:
                 progress = ""
 
-            # Last completed directory name (basename only, hidden already filtered)
+            # Items-found counter — visible immediately, before dirs are known
+            found_str = f"  {count} found" if count else ""
+
+            # Last directory being sized (basename only, hidden already filtered)
             label = f"  ← {name}" if name else ""
-            row1 = f" 📂 Sizing directories…{progress}{label}"
+            row1 = f" 📂 Sizing directories…{progress}{found_str}{label}"
             self.stdscr.addnstr(1, 0, row1[:w].ljust(w), w,
                                 curses.color_pair(C_STATUS) | curses.A_BOLD)
         else:
@@ -954,7 +1063,19 @@ class DiskVuApp:
 
         # ── Rows 2…h-3: entry list ────────────────────────────────────────
         if not self.entries:
-            if not self.scanning:
+            if self.scanning:
+                # Show live activity so the user knows work is happening
+                sp_chars = _SPINNER_ASCII if ASCII_MODE else SPINNER
+                spin = sp_chars[(self._spinner_frame - 1) % len(sp_chars)]
+                activity = self._scan_status or os.path.basename(self.current_path) or self.current_path
+                line1 = f"  {spin} Reading {self.current_path} …"
+                line2 = f"  {spin} Sizing  {activity} …" if self._scan_status else ""
+                self.stdscr.addnstr(3, 0, line1[:w], w,
+                                    curses.color_pair(C_STATUS) | curses.A_BOLD)
+                if line2 and h > 6:
+                    self.stdscr.addnstr(4, 0, line2[:w], w,
+                                        curses.color_pair(C_STATUS))
+            else:
                 self.stdscr.addnstr(3, 0, "  ✨ Nothing here! Squeaky clean 🧹", w,
                                     curses.color_pair(C_DIR) | curses.A_BOLD)
         else:
@@ -1016,18 +1137,21 @@ class DiskVuApp:
         self.stdscr.refresh()
 
     def _draw_entry(self, y: int, w: int, entry: DirEntry, selected: bool) -> None:
+        pending = entry.size == PENDING_SIZE
         unknown = entry.size == UNKNOWN_SIZE
         size_str = human_size(entry.size)
         semoji = size_emoji(entry.size)
 
         pct = (entry.size / self.total_size * 100
-               if (self.total_size > 0 and not unknown) else 0.0)
-        pct_str = "  ???%" if unknown else f"{pct:5.1f}%"
+               if (self.total_size > 0 and not unknown and not pending) else 0.0)
+        pct_str = "  ???%" if unknown else ("  ...%" if pending else f"{pct:5.1f}%")
 
         # Smooth bar with sub-character precision
         bar_max = 20
         if unknown:
             bar_str = "?" * bar_max
+        elif pending:
+            bar_str = "·" * bar_max if not ASCII_MODE else "." * bar_max
         elif ASCII_MODE:
             filled = int(pct / 100 * bar_max) if self.total_size > 0 else 0
             bar_str = "#" * filled + "-" * (bar_max - filled)
@@ -1055,7 +1179,8 @@ class DiskVuApp:
         elif entry.error == "symlink":
             name += " 🔗" if not ASCII_MODE else " [->]"
 
-        size_color = (C_ERROR if unknown
+        size_color = (C_BORDER if pending
+                      else C_ERROR if unknown
                       else C_SIZE_BIG if entry.size > 1024 ** 3
                       else C_SIZE_MED if entry.size > 100 * 1024 ** 2
                       else C_SIZE_SML)
@@ -1171,6 +1296,9 @@ class DiskVuApp:
         self.stdscr.timeout(100)
         if ch in (ord('y'), ord('Y')):
             try:
+                if entry.is_dir and entry.path in _PROTECTED_DELETE_PATHS:
+                    self._set_message("🚫 Cannot delete a protected system directory!")
+                    return
                 if entry.is_dir:
                     shutil.rmtree(entry.path)
                 else:

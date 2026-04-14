@@ -278,6 +278,8 @@ Type `y` or `Y` to confirm. Any other key cancels. After deletion the current di
 
 > **Warning:** deletion is immediate and permanent — there is no trash/recycle bin. Directories are removed with the equivalent of `rm -rf`.
 
+DiskVu refuses to delete protected system paths (`/`, `/etc`, `/usr`, `/bin`, `/System`, `~`, etc.) even when confirmed.
+
 ---
 
 ## Signal handling
@@ -317,6 +319,7 @@ Type `y` or `Y` to confirm. Any other key cancels. After deletion the current di
 
 | Version | Changes |
 |---------|---------|
+| 1.2.0 | Bug fixes: scan no longer hangs on unexpected errors; subprocess cleanup on exception; Python fallback walk respects cancellation; partial-results cache capped at 50 entries; delete blocked on protected system paths |
 | 1.1.0 | ASCII mode, network FS detection, argparse CLI, SIGTERM handler, `~` and `o` keys, expanded Linux skip list, reduced `du` timeout |
 | 1.0.0 | Initial release — streaming scan, parallel workers, cache, prefetch, delete |
 
