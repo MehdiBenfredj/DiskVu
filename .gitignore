@@ -1,0 +1,23 @@
+# Built binary
+diskvu
+diskvu-*
+
+# Go build cache
+*.test
+*.out
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Editor directories
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS-generated
+Thumbs.db
+ehthumbs.db
