@@ -230,6 +230,7 @@ var skipDirNames = map[string]bool{
 }
 
 var skipAbsPaths map[string]bool
+var protectedPaths map[string]bool
 
 func init() {
 	if runtime.GOOS == "darwin" {
@@ -241,6 +242,16 @@ func init() {
 			"/proc": true, "/sys": true, "/dev": true, "/run/user": true,
 			"/sys/kernel/debug": true, "/sys/kernel/tracing": true,
 		}
+	}
+
+	protectedPaths = map[string]bool{
+		"/": true, "/etc": true, "/usr": true, "/bin": true, "/sbin": true,
+		"/lib": true, "/lib64": true, "/boot": true, "/sys": true,
+		"/proc": true, "/dev": true, "/run": true, "/var": true,
+		"/System": true, "/Library": true, "/Applications": true,
+	}
+	if u, err := user.Current(); err == nil {
+		protectedPaths[u.HomeDir] = true
 	}
 }
 
@@ -314,20 +325,6 @@ func shouldSkip(path string, skipNet bool) bool {
 		return true
 	}
 	return false
-}
-
-var protectedPaths map[string]bool
-
-func init() {
-	protectedPaths = map[string]bool{
-		"/": true, "/etc": true, "/usr": true, "/bin": true, "/sbin": true,
-		"/lib": true, "/lib64": true, "/boot": true, "/sys": true,
-		"/proc": true, "/dev": true, "/run": true, "/var": true,
-		"/System": true, "/Library": true, "/Applications": true,
-	}
-	if u, err := user.Current(); err == nil {
-		protectedPaths[u.HomeDir] = true
-	}
 }
 
 func accessHint() string {
@@ -529,8 +526,11 @@ func scanDirectory(ctx context.Context, path string, skipNet bool, events chan<-
 				results = append(results, ent)
 				events <- ScanEvent{Entry: ent}
 			} else {
+				// Emit a pending placeholder for the streaming UI, but don't add it
+				// to `results` — the worker (Phase 2) will append the resolved entry.
+				// Otherwise the cached list ends up with both the placeholder and the
+				// real entry for every directory.
 				ent := &DirEntry{Name: e.Name(), Path: p, IsDir: true, Size: PendingSize}
-				results = append(results, ent)
 				events <- ScanEvent{Entry: ent}
 				dirItems = append(dirItems, e)
 			}
@@ -703,19 +703,15 @@ func (a *App) startScan() {
 				partial = append(partial, ent)
 			}
 			sort.Slice(partial, func(i, j int) bool {
-				pi, pj := partial[i].Size, partial[j].Size
-				// Pending/unknown entries go to the bottom.
-				if pi < 0 {
-					pi = -1
-				} else {
-					pi = 0
+				// Pending/unknown entries (negative sizes) sort to the bottom.
+				a, b := partial[i].Size, partial[j].Size
+				if a < 0 && b >= 0 {
+					return false
 				}
-				if pj < 0 {
-					pj = -1
-				} else {
-					pj = 0
+				if b < 0 && a >= 0 {
+					return true
 				}
-				return partial[i].Size+pi > partial[j].Size+pj
+				return a > b
 			})
 			var total int64
 			for _, e := range partial {
@@ -817,9 +813,13 @@ func (a *App) maybePrefetch() {
 	a.prefetchCancel = cancel
 
 	go func() {
-		events := make(chan ScanEvent, 1)
-		scanDirectory(ctx, target.Path, a.skipNet, events, a.cache)
-		for range events {} // drain
+		events := make(chan ScanEvent, 64)
+		go func() {
+			defer close(events)
+			scanDirectory(ctx, target.Path, a.skipNet, events, a.cache)
+		}()
+		for range events {
+		}
 	}()
 }
 
@@ -961,15 +961,15 @@ func (a *App) openInManager() {
 
 func (a *App) draw() {
 	w, h := a.screen.Size()
+	a.screen.Clear()
 	if h < 6 || w < 40 {
-		a.screen.Clear()
 		drawString(a.screen, 0, 0, "Terminal too small 😬", tcell.StyleDefault)
 		a.screen.Show()
 		return
 	}
 
 	lh := a.listHeight()
-	
+
 	// Row 0: Title
 	headerStyle := tcell.StyleDefault.Background(tcell.ColorDarkCyan).Foreground(tcell.ColorBlack).Bold(true)
 	fillLine(a.screen, 0, w, headerStyle)
@@ -1143,7 +1143,7 @@ func (a *App) drawEntry(y, w int, ent *DirEntry, selected bool) {
 	if ent.IsDir { nameColor = tcell.ColorDarkCyan }
 
 	if selected {
-		style := tcell.StyleDefault.Background(tcell.ColorWhite).Foreground(tcell.ColorBlack).Bold(true)
+		style := tcell.StyleDefault.Background(tcell.ColorNavy).Foreground(tcell.ColorWhite).Bold(true)
 		fillLine(a.screen, y, w-1, style)
 		col := 1
 		col = drawString(a.screen, col, y, sEmoji, style)
