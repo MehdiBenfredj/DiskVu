@@ -87,6 +87,12 @@ If `path` is omitted, the current directory (`.`) is used.
 | `o` | Open selected item in Finder / file manager |
 | `q` / `Esc` / `Q` | Quit |
 
+## Uninstall
+
+```bash
+sudo rm /usr/local/bin/diskvu
+```
+
 ## Releasing a new version
 
 Releases are fully automated via [GoReleaser](https://goreleaser.com/) and GitHub Actions.  
