@@ -222,13 +222,9 @@ func truncate(s string, maxRunes int) string {
 // Skip Logic & Mount Table
 // ═══════════════════════════════════════════════════════════════════════════════
 
-var skipDirNames = map[string]bool{
-	"proc": true, "sys": true, "dev": true, "run": true, "snap": true,
-	"debug": true, "tracing": true, "net": true, "home": true,
-	"cgroup": true, "cgroup2": true, "cgroupv2": true,
-	"configfs": true, "securityfs": true, "pstore": true, "efivarfs": true,
-}
-
+// Skips are matched by absolute path only. Matching by basename anywhere in
+// the tree is too aggressive — e.g. on EC2 `/home` is a real mount with user
+// data, but a basename match on "home" would skip it.
 var skipAbsPaths map[string]bool
 var protectedPaths map[string]bool
 
@@ -238,9 +234,12 @@ func init() {
 			"/private/var/vm": true, "/private/var/folders": true, "/cores": true,
 		}
 	} else {
+		// /sys covers debugfs, tracefs, cgroups, configfs, securityfs, pstore,
+		// efivarfs via prefix match. /proc covers /proc/net. /snap is squashfs
+		// package mounts that would inflate totals.
 		skipAbsPaths = map[string]bool{
-			"/proc": true, "/sys": true, "/dev": true, "/run/user": true,
-			"/sys/kernel/debug": true, "/sys/kernel/tracing": true,
+			"/proc": true, "/sys": true, "/dev": true,
+			"/run/user": true, "/snap": true,
 		}
 	}
 
@@ -317,9 +316,6 @@ func shouldSkip(path string, skipNet bool) bool {
 		if strings.HasPrefix(norm, prefix+"/") {
 			return true
 		}
-	}
-	if skipDirNames[filepath.Base(norm)] {
-		return true
 	}
 	if skipNet && isNetworkFS(path) {
 		return true
