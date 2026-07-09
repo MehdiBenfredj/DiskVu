@@ -40,6 +40,11 @@ const (
 	MaxPartialCap = 50
 	PrefetchMinMB = 300
 	BarWidth      = 20
+	// CacheTTL bounds how long a cached listing is trusted even if the
+	// directory's own mtime hasn't changed — mtime only reflects direct
+	// children, so changes deeper in the tree wouldn't otherwise be noticed
+	// until a manual rescan ('r').
+	CacheTTL = 5 * time.Minute
 )
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -68,6 +73,7 @@ type ScanEvent struct {
 // All App field mutations happen only on the main goroutine; the scan goroutine
 // communicates exclusively through this struct.
 type scanUpdate struct {
+	id        int // scan generation; the main loop discards updates from stale scans
 	entries   []*DirEntry
 	total     int64
 	status    string
@@ -75,12 +81,22 @@ type scanUpdate struct {
 	dirsTotal int
 	done      bool
 	scanTime  time.Duration
+	errMsg    string
 }
 
 type navHistory struct {
 	path   string
 	cursor int
 	scroll int
+}
+
+// pendingRestore is the cursor/scroll state to apply once a goBack-triggered
+// scan completes. childPath is the directory we just left — preferred over
+// the raw saved index since sort order shifts as sizes change between visits.
+type pendingRestore struct {
+	cursor    int
+	scroll    int
+	childPath string
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -334,15 +350,23 @@ func accessHint() string {
 // Scanner
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// cacheEntry holds a cached directory listing plus the bookkeeping needed to
+// decide when it's stale: mtime detects direct-child changes, added bounds
+// how long we trust it for changes deeper in the tree.
+type cacheEntry struct {
+	ents  []*DirEntry
+	mtime time.Time
+	added time.Time
+}
+
 // Cache stores directory scan results.
 type Cache struct {
-	mu    sync.RWMutex
-	ents  map[string][]*DirEntry
-	mtimes map[string]time.Time
+	mu      sync.RWMutex
+	entries map[string]cacheEntry
 }
 
 func NewCache() *Cache {
-	return &Cache{ents: make(map[string][]*DirEntry), mtimes: make(map[string]time.Time)}
+	return &Cache{entries: make(map[string]cacheEntry)}
 }
 
 func (c *Cache) Get(path string) ([]*DirEntry, bool) {
@@ -352,11 +376,11 @@ func (c *Cache) Get(path string) ([]*DirEntry, bool) {
 	if err != nil {
 		return nil, false
 	}
-	if mt, ok := c.mtimes[path]; ok && mt == stat.ModTime() {
-		ents, okE := c.ents[path]
-		return ents, okE
+	ce, ok := c.entries[path]
+	if !ok || ce.mtime != stat.ModTime() || time.Since(ce.added) > CacheTTL {
+		return nil, false
 	}
-	return nil, false
+	return ce.ents, true
 }
 
 func (c *Cache) Put(path string, entries []*DirEntry) {
@@ -366,15 +390,26 @@ func (c *Cache) Put(path string, entries []*DirEntry) {
 	if err != nil {
 		return
 	}
-	c.ents[path] = entries
-	c.mtimes[path] = stat.ModTime()
+	c.entries[path] = cacheEntry{ents: entries, mtime: stat.ModTime(), added: time.Now()}
 }
 
 func (c *Cache) Invalidate(path string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	delete(c.ents, path)
-	delete(c.mtimes, path)
+	delete(c.entries, path)
+}
+
+// InvalidateTree removes path and every cached entry nested under it —
+// e.g. subtrees the background prefetcher cached before path was deleted.
+func (c *Cache) InvalidateTree(path string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	prefix := path + "/"
+	for k := range c.entries {
+		if k == path || strings.HasPrefix(k, prefix) {
+			delete(c.entries, k)
+		}
+	}
 }
 
 // computeDirSize is the pure-Go recursive fallback if `du` fails.
@@ -476,8 +511,9 @@ fallback:
 		if os.IsPermission(err) {
 			return UnknownSize, 0, "inaccessible"
 		}
+	} else {
+		f.Close()
 	}
-	f.Close()
 
 	size, count := computeDirSize(ctx, path, 0)
 	return size, count, errMsg
@@ -485,10 +521,23 @@ fallback:
 
 // scanDirectory performs the concurrent scan and streams results.
 func scanDirectory(ctx context.Context, path string, skipNet bool, events chan<- ScanEvent, cache *Cache) ([]*DirEntry, error) {
+	// All sends must abort on cancellation: the consumer may stop reading, and
+	// an unconditional send would block workers forever (goroutine leak).
+	emit := func(ev ScanEvent) bool {
+		select {
+		case events <- ev:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
+
 	// Check cache first
 	if cached, ok := cache.Get(path); ok {
 		for _, e := range cached {
-			events <- ScanEvent{Entry: e}
+			if !emit(ScanEvent{Entry: e}) {
+				break
+			}
 		}
 		return cached, nil
 	}
@@ -514,30 +563,30 @@ func scanDirectory(ctx context.Context, path string, skipNet bool, events chan<-
 		if isSymlink {
 			ent := &DirEntry{Name: e.Name(), Path: filepath.Join(path, e.Name()), Size: info.Size(), Error: "symlink"}
 			results = append(results, ent)
-			events <- ScanEvent{Entry: ent}
+			emit(ScanEvent{Entry: ent})
 		} else if e.IsDir() {
 			p := filepath.Join(path, e.Name())
 			if shouldSkip(p, skipNet) {
 				ent := &DirEntry{Name: e.Name(), Path: p, IsDir: true, Error: "skipped"}
 				results = append(results, ent)
-				events <- ScanEvent{Entry: ent}
+				emit(ScanEvent{Entry: ent})
 			} else {
 				// Emit a pending placeholder for the streaming UI, but don't add it
 				// to `results` — the worker (Phase 2) will append the resolved entry.
 				// Otherwise the cached list ends up with both the placeholder and the
 				// real entry for every directory.
 				ent := &DirEntry{Name: e.Name(), Path: p, IsDir: true, Size: PendingSize}
-				events <- ScanEvent{Entry: ent}
+				emit(ScanEvent{Entry: ent})
 				dirItems = append(dirItems, e)
 			}
 		} else {
 			ent := &DirEntry{Name: e.Name(), Path: filepath.Join(path, e.Name()), Size: info.Size()}
 			results = append(results, ent)
-			events <- ScanEvent{Entry: ent}
+			emit(ScanEvent{Entry: ent})
 		}
 	}
 
-	events <- ScanEvent{DirTotal: len(dirItems)}
+	emit(ScanEvent{DirTotal: len(dirItems)})
 
 	// Phase 2: Size directories in parallel
 	var wg sync.WaitGroup
@@ -563,7 +612,9 @@ func scanDirectory(ctx context.Context, path string, skipNet bool, events chan<-
 				p := filepath.Join(path, item.Name())
 				base := item.Name()
 				if !strings.HasPrefix(base, ".") {
-					events <- ScanEvent{Message: base}
+					if !emit(ScanEvent{Message: base}) {
+						return
+					}
 				}
 
 				size, count, errStr := workerSizeDir(ctx, p, skipNet)
@@ -577,7 +628,9 @@ func scanDirectory(ctx context.Context, path string, skipNet bool, events chan<-
 				results = append(results, ent)
 				mu.Unlock()
 
-				events <- ScanEvent{Entry: ent, DirDone: true}
+				if !emit(ScanEvent{Entry: ent, DirDone: true}) {
+					return
+				}
 			}
 		}()
 	}
@@ -587,6 +640,12 @@ func scanDirectory(ctx context.Context, path string, skipNet bool, events chan<-
 	}
 	close(jobs)
 	wg.Wait()
+
+	// A cancelled scan has incomplete results — caching them would serve a
+	// truncated listing as authoritative on the next visit.
+	if ctx.Err() != nil {
+		return results, ctx.Err()
+	}
 
 	sort.Slice(results, func(i, j int) bool {
 		return results[i].Size > results[j].Size
@@ -612,17 +671,18 @@ type App struct {
 	totalSize   int64
 	scanTime    time.Duration
 	history     []navHistory
+	pendingNav  *pendingRestore // cursor/scroll to restore once the next scan completes
 
-	scanning  bool
-	scanID    int
+	scanning   bool
+	scanID     int
 	scanCancel context.CancelFunc
 
 	message     string
 	messageTime time.Time
 
 	// Live progress tracking
-	scanStatus   string
-	scanDirsDone int
+	scanStatus    string
+	scanDirsDone  int
 	scanDirsTotal int
 
 	prefetchCancel context.CancelFunc
@@ -665,6 +725,9 @@ func (a *App) startScan() {
 	a.scanCancel = cancel
 	a.scanID++
 	currentScanID := a.scanID
+	// Capture for the goroutines below: a.currentPath belongs to the main
+	// goroutine and may change while a stale scan is still winding down.
+	scanPath := a.currentPath
 
 	a.scanning = true
 	a.scanStatus = ""
@@ -675,12 +738,17 @@ func (a *App) startScan() {
 	a.entries = nil
 	a.cursor = 0
 	a.scroll = 0
+	a.pendingNav = nil
 
 	events := make(chan ScanEvent, 100)
 
+	// scanErr is written before close(events) and read only after the range
+	// over events completes, so the channel close orders the accesses.
+	var scanErr error
+
 	go func() {
 		defer close(events)
-		scanDirectory(ctx, a.currentPath, a.skipNet, events, a.cache)
+		_, scanErr = scanDirectory(ctx, scanPath, a.skipNet, events, a.cache)
 	}()
 
 	// Drain events in background. This goroutine NEVER writes App fields directly;
@@ -716,6 +784,7 @@ func (a *App) startScan() {
 				}
 			}
 			return scanUpdate{
+				id:        currentScanID,
 				entries:   partial,
 				total:     total,
 				status:    status,
@@ -734,8 +803,8 @@ func (a *App) startScan() {
 		}
 
 		for ev := range events {
-			if ctx.Err() != nil || a.scanID != currentScanID {
-				return
+			if ctx.Err() != nil {
+				continue // cancelled: keep draining so producers can finish
 			}
 			if ev.Entry != nil {
 				seen[ev.Entry.Path] = ev.Entry
@@ -757,28 +826,40 @@ func (a *App) startScan() {
 			}
 		}
 
+		if ctx.Err() != nil {
+			return // cancelled: a newer scan owns the UI now
+		}
+
 		// Scan finished naturally — send the authoritative final state.
-		if a.scanID == currentScanID {
-			if cached, ok := a.cache.Get(a.currentPath); ok {
-				var total int64
-				for _, e := range cached {
-					if e.Size > 0 {
-						total += e.Size
-					}
+		var upd scanUpdate
+		if cached, ok := a.cache.Get(scanPath); ok {
+			var total int64
+			for _, e := range cached {
+				if e.Size > 0 {
+					total += e.Size
 				}
-				trySend(scanUpdate{
-					entries:   cached,
-					total:     total,
-					status:    status,
-					dirsDone:  dirsDone,
-					dirsTotal: dirsTotal,
-					done:      true,
-					scanTime:  time.Since(t0),
-				})
-			} else {
-				upd := buildUpdate(true)
-				trySend(upd)
 			}
+			upd = scanUpdate{
+				id:        currentScanID,
+				entries:   cached,
+				total:     total,
+				status:    status,
+				dirsDone:  dirsDone,
+				dirsTotal: dirsTotal,
+				done:      true,
+				scanTime:  time.Since(t0),
+			}
+		} else {
+			upd = buildUpdate(true)
+		}
+		if scanErr != nil {
+			upd.errMsg = fmt.Sprintf("😬 Scan failed: %v", scanErr)
+		}
+		// The final update must not be dropped, or the UI would stay in
+		// "scanning" mode forever. Block until delivered or superseded.
+		select {
+		case a.scanUpdates <- upd:
+		case <-ctx.Done():
 		}
 	}()
 }
@@ -845,7 +926,7 @@ func (a *App) enterDir() {
 		a.setMessage("🚫 That's a file, not a folder!")
 		return
 	}
-	if ent.Error == "permission denied" || ent.Error == "skipped" {
+	if ent.Error == "inaccessible" || ent.Error == "skipped" {
 		a.setMessage("🔒 Access denied — this folder doesn't want visitors")
 		return
 	}
@@ -864,10 +945,10 @@ func (a *App) goBack() {
 		prev := a.history[len(a.history)-1]
 		if prev.path == parent {
 			a.history = a.history[:len(a.history)-1]
+			childPath := a.currentPath // the directory we're leaving
 			a.currentPath = parent
 			a.startScan()
-			// Restore position after scan finishes naturally is tricky in async.
-			// For simplicity, rescan resets cursor. A real app would delay clearing entries.
+			a.pendingNav = &pendingRestore{cursor: prev.cursor, scroll: prev.scroll, childPath: childPath}
 			return
 		}
 	}
@@ -876,10 +957,14 @@ func (a *App) goBack() {
 	a.startScan()
 }
 
-func (a *App) deleteSelected() {
+// deleteSelected prompts for confirmation by reading from eventCh — the same
+// channel the main loop consumes. The main loop is blocked in this call, so
+// reading here is safe; polling the screen directly would race with the
+// event-forwarding goroutine and lose keystrokes.
+func (a *App) deleteSelected(eventCh <-chan tcell.Event) {
 	if len(a.entries) == 0 { return }
 	ent := a.entries[a.cursor]
-	
+
 	if ent.IsDir && protectedPaths[ent.Path] {
 		a.setMessage("🚫 Cannot delete a protected system directory!")
 		return
@@ -895,8 +980,7 @@ func (a *App) deleteSelected() {
 	a.screen.Show()
 
 	// Wait for input
-	for {
-		ev := a.screen.PollEvent()
+	for ev := range eventCh {
 		if ev, ok := ev.(*tcell.EventKey); ok {
 			if ev.Rune() == 'y' || ev.Rune() == 'Y' {
 				var err error
@@ -908,7 +992,20 @@ func (a *App) deleteSelected() {
 				if err != nil {
 					a.setMessage(fmt.Sprintf("😬 Error: %v", err))
 				} else {
-					a.cache.Invalidate(a.currentPath)
+					if ent.IsDir {
+						// Purge any subtree the background prefetcher cached
+						// under the now-deleted directory.
+						a.cache.InvalidateTree(ent.Path)
+					}
+					// mtime only reflects direct children, so a delete inside a
+					// grandchild directory wouldn't otherwise be noticed by any
+					// ancestor's cached listing until a manual rescan.
+					for p := ent.Path; ; p = filepath.Dir(p) {
+						a.cache.Invalidate(p)
+						if p == filepath.Dir(p) {
+							break
+						}
+					}
 					a.setMessage(fmt.Sprintf("💥 Obliterated: %s", ent.Name))
 					a.startScan()
 				}
@@ -947,6 +1044,7 @@ func (a *App) openInManager() {
 	if err := cmd.Start(); err != nil {
 		a.setMessage(fmt.Sprintf("Could not open: %v", err))
 	} else {
+		go cmd.Wait() // reap the child so it doesn't linger as a zombie
 		a.setMessage("📂 Opened in file manager")
 	}
 }
@@ -1130,10 +1228,10 @@ func (a *App) drawEntry(y, w int, ent *DirEntry, selected bool) {
 	}
 
 	sizeColor := tcell.ColorGreen
-	if pending { sizeColor = tcell.ColorBlue } 
+	if pending { sizeColor = tcell.ColorBlue }
 	if unknown { sizeColor = tcell.ColorRed }
-	if ent.Size > 1<<30 { sizeColor = tcell.ColorRed } 
 	if ent.Size > 100<<20 { sizeColor = tcell.ColorYellow }
+	if ent.Size > 1<<30 { sizeColor = tcell.ColorRed }
 
 	nameColor := tcell.ColorWhite
 	if ent.IsDir { nameColor = tcell.ColorDarkCyan }
@@ -1181,11 +1279,6 @@ func (a *App) drawEntry(y, w int, ent *DirEntry, selected bool) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 func main() {
-    defaultPath := "."
-    if len(os.Args) > 1 {
-        defaultPath = os.Args[1]
-    }
-
     skipNet := flag.Bool("skip-network", false, "skip NFS, CIFS, and other network/remote filesystems")
     version := flag.Bool("V", false, "print version")
     flag.Parse()
@@ -1195,9 +1288,8 @@ func main() {
         os.Exit(0)
     }
 
-    args := flag.Args()
-    path := defaultPath
-    if len(args) > 0 {
+    path := "."
+    if args := flag.Args(); len(args) > 0 {
         path = args[0]
     }
 
@@ -1260,17 +1352,42 @@ func main() {
 
         case upd := <-app.scanUpdates:
             // Apply state from the scan goroutine — only safe place to mutate App.
-            app.entries = upd.entries
-            app.totalSize = upd.total
-            app.scanStatus = upd.status
-            app.scanDirsDone = upd.dirsDone
-            app.scanDirsTotal = upd.dirsTotal
-            if upd.done {
-                app.scanning = false
-                app.scanTime = upd.scanTime
-                app.cursor = 0
-                app.scroll = 0
-                app.maybePrefetch()
+            // Updates from a superseded scan are discarded.
+            if upd.id == app.scanID {
+                app.entries = upd.entries
+                app.totalSize = upd.total
+                app.scanStatus = upd.status
+                app.scanDirsDone = upd.dirsDone
+                app.scanDirsTotal = upd.dirsTotal
+                if upd.done {
+                    app.scanning = false
+                    app.scanTime = upd.scanTime
+                    app.cursor, app.scroll = 0, 0
+                    if app.pendingNav != nil {
+                        restoreCursor := clamp(app.pendingNav.cursor, 0, max(0, len(app.entries)-1))
+                        // Prefer landing on the directory just left over the raw
+                        // saved index — sort order shifts as sizes change between visits.
+                        for i, e := range app.entries {
+                            if e.Path == app.pendingNav.childPath {
+                                restoreCursor = i
+                                break
+                            }
+                        }
+                        app.cursor = restoreCursor
+                        lh := app.listHeight()
+                        app.scroll = clamp(app.pendingNav.scroll, 0, max(0, len(app.entries)-lh))
+                        if app.cursor < app.scroll {
+                            app.scroll = app.cursor
+                        } else if app.cursor >= app.scroll+lh {
+                            app.scroll = app.cursor - lh + 1
+                        }
+                        app.pendingNav = nil
+                    }
+                    if upd.errMsg != "" {
+                        app.setMessage(upd.errMsg)
+                    }
+                    app.maybePrefetch()
+                }
             }
             app.draw()
 
@@ -1285,7 +1402,7 @@ func main() {
             case *tcell.EventResize:
                 s.Sync()
             case *tcell.EventKey:
-                if ev.Key() == tcell.KeyEscape || ev.Rune() == 'q' || ev.Rune() == 'Q' {
+                if ev.Key() == tcell.KeyEscape || ev.Key() == tcell.KeyCtrlC || ev.Rune() == 'q' || ev.Rune() == 'Q' {
                     if app.scanCancel != nil {
                         app.scanCancel()
                     }
@@ -1307,7 +1424,7 @@ func main() {
                     app.moveCursor(len(app.entries))
                 case tcell.KeyEnter, tcell.KeyRight:
                     app.enterDir()
-                case tcell.KeyBackspace, tcell.KeyLeft:
+                case tcell.KeyBackspace, tcell.KeyBackspace2, tcell.KeyLeft:
                     app.goBack()
                 }
 
@@ -1327,12 +1444,12 @@ func main() {
                 case 'r':
                     if !app.scanning {
                         app.cache.Invalidate(app.currentPath)
-                        app.setMessage("🔄 Fresh scan complete!")
+                        app.setMessage("🔄 Rescanning…")
                         app.startScan()
                     }
                 case 'd':
                     if !app.scanning {
-                        app.deleteSelected()
+                        app.deleteSelected(eventCh)
                     }
                 case '~':
                     if !app.scanning {
